@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SAE Feature Visualizer — Central Configuration
+# Override any value via CLI flags on individual scripts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  name: gpt2              # gpt2 | gpt2-medium | gpt2-large | gpt2-xl
+  layer: 8                # Which transformer block to hook (0-11 for base gpt2)
+  d_model: 768             # GPT-2 base hidden size
+
+corpus:
+  source: pile             # pile | openwebtext
+  path: data/pile_sample.jsonl
+  max_sentences: 50000
+  max_token_length: 64
+  min_char_length: 20
+
+sae:
+  d_hidden: 4096            # 5.33x expansion over d_model
+  l1_lambda: 0.001          # Sparsity penalty weight — tune this first
+  target_active_min: 20     # Healthy active-features-per-token lower bound
+  target_active_max: 50     # Healthy active-features-per-token upper bound
+  tied_weights: false
+
+training:
+  epochs: 10
+  batch_size: 256
+  learning_rate: 0.0002     # Adam
+  val_split: 0.1
+  seed: 42
+
+analysis:
+  top_n_examples: 20
+  sanity_test_sentence_a: "The attorney filed a motion in court"
+  sanity_test_sentence_b: "The protein binds to the receptor"
+
+paths:
+  cache_dir: cache
+  checkpoint_dir: checkpoints
+  data_dir: data
