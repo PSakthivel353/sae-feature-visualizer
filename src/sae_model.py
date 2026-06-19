@@ -33,6 +33,8 @@ class SparseAutoencoder(nn.Module):
         d_hidden: Dimensionality of the sparse hidden layer (4096 = 5.33x expansion)
         tied_weights: If True, decoder weights = encoder weights transposed
                        (reduces parameters, sometimes improves training stability)
+        sparsity_type: 'l1' (soft penalty) or 'topk' (hard cutoff)
+        topk: Number of top features to keep active (only used if sparsity_type='topk')
     """
 
     def __init__(
@@ -40,14 +42,22 @@ class SparseAutoencoder(nn.Module):
         d_model: int = 768,
         d_hidden: int = 4096,
         tied_weights: bool = False,
+        sparsity_type: str = "l1",
+        topk: int = 32,
     ):
         super().__init__()
         self.d_model = d_model
         self.d_hidden = d_hidden
         self.tied_weights = tied_weights
+        self.sparsity_type = sparsity_type
+        self.topk = topk
 
         self.encoder = nn.Linear(d_model, d_hidden, bias=True)
-        self.relu = nn.ReLU()
+
+        if sparsity_type == "l1":
+            self.relu = nn.ReLU()
+        elif sparsity_type != "topk":
+            raise ValueError(f"Unknown sparsity_type: {sparsity_type}")
 
         if tied_weights:
             # Decoder reuses encoder weights (transposed) — saves params
@@ -58,18 +68,13 @@ class SparseAutoencoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """
-        Standard SAE initialization: decoder columns unit-norm.
-        This keeps early training stable — without it, some features can
-        explode or vanish in the first few steps.
-        """
+        """Standard SAE initialization: decoder columns unit-norm."""
         nn.init.kaiming_uniform_(self.encoder.weight, nonlinearity="relu")
         nn.init.zeros_(self.encoder.bias)
 
         if not self.tied_weights:
             nn.init.kaiming_uniform_(self.decoder.weight)
             nn.init.zeros_(self.decoder.bias)
-            # Normalize decoder weight columns (each feature's output direction)
             with torch.no_grad():
                 self.decoder.weight.data = (
                     self.decoder.weight.data
@@ -83,9 +88,20 @@ class SparseAutoencoder(nn.Module):
         Args:
             x: (batch, d_model)
         Returns:
-            hidden: (batch, d_hidden), most values are exactly 0 due to ReLU
+            hidden: (batch, d_hidden), sparse with exactly topk nonzeros (if topk mode)
         """
-        return self.relu(self.encoder(x))
+        pre_activation = self.encoder(x)
+
+        if self.sparsity_type == "l1":
+            return torch.relu(pre_activation)
+        elif self.sparsity_type == "topk":
+            # Keep only the top-k activations, zero out the rest
+            topk_vals, topk_idxs = torch.topk(pre_activation, self.topk, dim=1, largest=True)
+            hidden = torch.zeros_like(pre_activation)
+            hidden.scatter_(1, topk_idxs, topk_vals)
+            return hidden
+        else:
+            raise ValueError(f"Unknown sparsity_type: {self.sparsity_type}")
 
     def decode(self, hidden: torch.Tensor) -> torch.Tensor:
         """
@@ -134,23 +150,34 @@ def compute_loss(
     target: torch.Tensor,
     hidden: torch.Tensor,
     l1_lambda: float = 1e-3,
+    sparsity_type: str = "l1",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the SAE training loss:
-        L = MSE(recon, target) + lambda * mean(|hidden|)
+      - If sparsity_type='l1': L = MSE(recon, target) + lambda * mean(|hidden|)
+      - If sparsity_type='topk': L = MSE(recon, target)  (sparsity is enforced directly)
 
     Args:
-        recon:     (batch, d_model) reconstructed activations
-        target:    (batch, d_model) original (normalized) activations
-        hidden:    (batch, d_hidden) sparse feature activations
-        l1_lambda: sparsity penalty weight
+        recon:          (batch, d_model) reconstructed activations
+        target:         (batch, d_model) original (normalized) activations
+        hidden:         (batch, d_hidden) sparse feature activations
+        l1_lambda:      sparsity penalty weight (only used for L1 mode)
+        sparsity_type:  'l1' or 'topk'
 
     Returns:
         total_loss, recon_loss, sparsity_loss  (all scalars)
     """
     recon_loss = ((recon - target) ** 2).mean()
-    sparsity_loss = hidden.abs().mean()
-    total_loss = recon_loss + l1_lambda * sparsity_loss
+
+    if sparsity_type == "topk":
+        # Top-K mode: sparsity is direct, no soft penalty needed
+        sparsity_loss = torch.tensor(0.0, device=recon.device)
+        total_loss = recon_loss
+    else:
+        # L1 mode: soft sparsity penalty
+        sparsity_loss = hidden.abs().mean()
+        total_loss = recon_loss + l1_lambda * sparsity_loss
+
     return total_loss, recon_loss, sparsity_loss
 
 

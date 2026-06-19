@@ -1,0 +1,23 @@
+{
+  "sentence_a": "The attorney filed a motion in court",
+  "sentence_b": "The protein binds to the receptor",
+  "top5_features_a": [
+    343,
+    588,
+    743,
+    788,
+    922
+  ],
+  "top5_features_b": [
+    61,
+    227,
+    687,
+    743,
+    759
+  ],
+  "overlap": [
+    743
+  ],
+  "passed": false,
+  "diagnosis": "\u26a0\ufe0f  Features overlap \u2014 lambda may be too low (not sparse enough). Consider increasing it."
+}

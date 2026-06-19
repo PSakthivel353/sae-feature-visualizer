@@ -30,6 +30,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sae_model import SparseAutoencoder
+from collect_activations import load_activation_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -237,9 +238,16 @@ def main():
     sae = load_trained_sae(args.checkpoint, device)
 
     logger.info("Loading cached activations and metadata...")
-    acts = torch.load(f"{args.cache_dir}/layer{args.layer}_acts.pt").float()
-    token_metadata = torch.load(f"{args.cache_dir}/layer{args.layer}_token_metadata.pt")
-    source_texts = torch.load(f"{args.cache_dir}/layer{args.layer}_source_texts.pt")
+    cache_manifest = Path(args.cache_dir) / f"layer{args.layer}_chunk_manifest.json"
+    cache_tensor = Path(args.cache_dir) / f"layer{args.layer}_acts.pt"
+
+    if cache_manifest.exists():
+        cache_path = str(cache_manifest)
+    else:
+        cache_path = str(cache_tensor)
+
+    acts, token_metadata, source_texts = load_activation_cache(cache_path, device=device)
+    acts = acts.float()
 
     norm_stats_path = "checkpoints/normalization_stats.pt"
 

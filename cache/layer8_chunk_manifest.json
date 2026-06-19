@@ -1,0 +1,43 @@
+{
+  "chunk_size": 100000,
+  "chunks": [
+    {
+      "acts": "layer8_acts_chunk_0000.pt",
+      "metadata": "layer8_token_metadata_chunk_0000.pt",
+      "rows": "100021"
+    },
+    {
+      "acts": "layer8_acts_chunk_0001.pt",
+      "metadata": "layer8_token_metadata_chunk_0001.pt",
+      "rows": "100002"
+    },
+    {
+      "acts": "layer8_acts_chunk_0002.pt",
+      "metadata": "layer8_token_metadata_chunk_0002.pt",
+      "rows": "100011"
+    },
+    {
+      "acts": "layer8_acts_chunk_0003.pt",
+      "metadata": "layer8_token_metadata_chunk_0003.pt",
+      "rows": "100009"
+    },
+    {
+      "acts": "layer8_acts_chunk_0004.pt",
+      "metadata": "layer8_token_metadata_chunk_0004.pt",
+      "rows": "100028"
+    },
+    {
+      "acts": "layer8_acts_chunk_0005.pt",
+      "metadata": "layer8_token_metadata_chunk_0005.pt",
+      "rows": "100004"
+    },
+    {
+      "acts": "layer8_acts_chunk_0006.pt",
+      "metadata": "layer8_token_metadata_chunk_0006.pt",
+      "rows": "39498"
+    }
+  ],
+  "layer": 8,
+  "model_name": "gpt2",
+  "total_tokens": 639573
+}

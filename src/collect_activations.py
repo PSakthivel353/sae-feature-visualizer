@@ -25,7 +25,7 @@ import argparse
 import logging
 from pathlib import Path
 from tqdm import tqdm
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 # Import from sibling modules (add src/ to path when running directly)
 import sys
@@ -81,6 +81,76 @@ def load_corpus(corpus_path: str, max_sentences: int = 50_000) -> List[str]:
     return texts
 
 
+def load_activation_cache(
+    cache_path: str,
+    device: str = "cpu",
+) -> Tuple[torch.Tensor, List[Tuple[str, int]], List[str]]:
+    """
+    Load cached activations from either:
+      - a single .pt tensor file, or
+      - a manifest JSON produced by chunked collection.
+
+    Returns:
+        (acts, token_metadata, source_texts)
+    """
+    path = Path(cache_path)
+
+    # If the user passes a missing default path, try to locate the chunk manifest.
+    if not path.exists():
+        base_name = path.stem.replace("_acts", "")
+        candidate_paths = [
+            path,
+            path.parent / f"{base_name}_chunk_manifest.json",
+            path.parent / f"{path.stem.replace('_acts', '')}_chunk_manifest.json",
+        ]
+        for candidate in candidate_paths:
+            if candidate.exists():
+                path = candidate
+                break
+        else:
+            manifest_candidates = sorted(path.parent.glob("*_chunk_manifest.json"))
+            if manifest_candidates:
+                path = manifest_candidates[0]
+            else:
+                raise FileNotFoundError(
+                    f"Could not find activation cache at '{cache_path}'. "
+                    f"Expected either a merged tensor or a *_chunk_manifest.json file."
+                )
+
+    if path.suffix == ".json" and path.name.endswith("_chunk_manifest.json"):
+        with open(path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        chunk_files = manifest.get("chunks", [])
+        chunk_tensors = []
+        token_metadata = []
+
+        for chunk in chunk_files:
+            acts_path = path.parent / chunk["acts"]
+            meta_path = path.parent / chunk["metadata"]
+            if not acts_path.exists():
+                raise FileNotFoundError(f"Missing chunk activation file: {acts_path}")
+            if not meta_path.exists():
+                raise FileNotFoundError(f"Missing chunk metadata file: {meta_path}")
+            chunk_tensors.append(torch.load(acts_path, map_location=device))
+            token_metadata.extend(torch.load(meta_path, map_location="cpu"))
+
+        acts = torch.cat(chunk_tensors, dim=0) if chunk_tensors else torch.empty(0, 0)
+        source_texts_path = path.parent / f"{path.stem.replace('_chunk_manifest', '')}_source_texts.pt"
+        source_texts = torch.load(source_texts_path, map_location="cpu") if source_texts_path.exists() else []
+        return acts, token_metadata, source_texts
+
+    # Support the legacy / default layout: layer8_acts.pt + layer8_token_metadata.pt
+    acts = torch.load(path, map_location=device)
+    base_name = path.stem.replace("_acts", "")
+    token_metadata_path = path.parent / f"{base_name}_token_metadata.pt"
+    source_texts_path = path.parent / f"{base_name}_source_texts.pt"
+
+    token_metadata = torch.load(token_metadata_path, map_location="cpu") if token_metadata_path.exists() else []
+    source_texts = torch.load(source_texts_path, map_location="cpu") if source_texts_path.exists() else []
+    return acts, token_metadata, source_texts
+
+
 def collect_activations(
     corpus_path: str,
     output_dir: str = "cache",
@@ -88,6 +158,7 @@ def collect_activations(
     max_sentences: int = 50_000,
     max_length: int = 64,
     batch_size: int = 16,
+    chunk_size: int = 250_000,
     use_half: bool = False,
     model_name: str = "gpt2",
     device: Optional[str] = None,
@@ -122,86 +193,150 @@ def collect_activations(
     # ── Load corpus ───────────────────────────────────────────────────────────
     texts = load_corpus(corpus_path, max_sentences)
 
-    # ── Collect activations ───────────────────────────────────────────────────
-    all_acts: List[torch.Tensor] = []
-    token_metadata: List[Tuple[str, int]] = []  # (token_str, sentence_idx)
-
+    # ── Collect activations in chunks ───────────────────────────────────────
     logger.info(f"Collecting activations from layer {layer}...")
     failed = 0
+    total_tokens = 0
+    chunk_idx = 0
+    chunk_rows = 0
+    chunk_acts: List[torch.Tensor] = []
+    chunk_meta: List[Tuple[str, int]] = []
+    chunk_manifest: List[Dict[str, str]] = []
 
-    for sent_idx, text in enumerate(tqdm(texts, desc="Processing sentences")):
+    def flush_chunk() -> None:
+        nonlocal chunk_idx, chunk_rows, total_tokens
+        if not chunk_acts:
+            return
+
+        chunk_tensor = torch.cat(chunk_acts, dim=0)
+        acts_path = Path(output_dir) / f"layer{layer}_acts_chunk_{chunk_idx:04d}.pt"
+        meta_path = Path(output_dir) / f"layer{layer}_token_metadata_chunk_{chunk_idx:04d}.pt"
+
+        torch.save(chunk_tensor, acts_path)
+        torch.save(chunk_meta, meta_path)
+
+        chunk_manifest.append(
+            {
+                "acts": acts_path.name,
+                "metadata": meta_path.name,
+                "rows": str(chunk_tensor.shape[0]),
+            }
+        )
+
+        logger.info(
+            f"Saved chunk {chunk_idx + 1}: {acts_path.name} "
+            f"({chunk_tensor.shape[0]:,} rows)"
+        )
+
+        chunk_idx += 1
+        chunk_rows = 0
+        chunk_acts.clear()
+        chunk_meta.clear()
+
+    for batch_start in tqdm(range(0, len(texts), batch_size), desc="Processing batches"):
+        batch_texts = texts[batch_start : batch_start + batch_size]
+        batch_indices = range(batch_start, min(batch_start + batch_size, len(texts)))
+
         try:
-            tokens = tokenizer(
-                text,
+            batch_tokens = tokenizer(
+                batch_texts,
                 return_tensors="pt",
                 truncation=True,
                 max_length=max_length,
-                padding=False,
+                padding=True,
             )
-            tokens = {k: v.to(device) for k, v in tokens.items()}
+            batch_tokens = {k: v.to(device) for k, v in batch_tokens.items()}
 
             with torch.no_grad():
-                model(**tokens)
+                model(**batch_tokens)
 
-            act = get_activation(layer_key)  # (1, seq_len, 768)
+            act = get_activation(layer_key)  # (batch, seq_len, 768)
             if act is None:
                 continue
 
-            act = act.squeeze(0).cpu()  # (seq_len, 768)
-
+            act = act.detach().cpu()
             if use_half:
                 act = act.half()
 
-            all_acts.append(act)
+            input_ids = batch_tokens["input_ids"].cpu()
+            attention_mask = batch_tokens.get("attention_mask", None)
 
-            # Store token strings for later interpretability lookups
-            token_strings = tokenizer.convert_ids_to_tokens(
-                tokens["input_ids"][0].cpu()
-            )
-            for tok_str in token_strings:
-                token_metadata.append((tok_str, sent_idx))
+            for i, sent_idx in enumerate(batch_indices):
+                if attention_mask is not None:
+                    valid_len = int(attention_mask[i].sum().item())
+                else:
+                    valid_len = int(input_ids[i].numel())
+
+                if valid_len <= 0:
+                    continue
+
+                sample_act = act[i, :valid_len].contiguous()
+                sample_ids = input_ids[i, :valid_len]
+
+                if sample_act.shape[0] != sample_ids.shape[0]:
+                    continue
+
+                token_strings = tokenizer.convert_ids_to_tokens(sample_ids.tolist())
+
+                chunk_acts.append(sample_act)
+                for tok_str in token_strings:
+                    chunk_meta.append((tok_str, sent_idx))
+
+                chunk_rows += sample_act.shape[0]
+                total_tokens += sample_act.shape[0]
+
+                if chunk_rows >= chunk_size:
+                    flush_chunk()
 
         except Exception as e:
             failed += 1
             if failed <= 5:
-                logger.warning(f"Sentence {sent_idx} failed: {e}")
+                logger.warning(f"Batch starting at {batch_start} failed: {e}")
             continue
 
+    flush_chunk()
     remove_hooks()
 
-    if not all_acts:
+    if not chunk_manifest:
         raise RuntimeError(
             "No activations collected! Check your corpus path and format."
         )
 
-    logger.info(f"Processed {len(all_acts):,} sentences ({failed} failed)")
+    logger.info(
+        f"Processed {len(texts):,} sentences ({failed} failed); "
+        f"saved {total_tokens:,} token rows across {len(chunk_manifest)} chunks"
+    )
 
-    # ── Concatenate and save ──────────────────────────────────────────────────
-    activation_tensor = torch.cat(all_acts, dim=0)  # (N_tokens, 768)
-
-    acts_path = Path(output_dir) / f"layer{layer}_acts.pt"
-    meta_path = Path(output_dir) / f"layer{layer}_token_metadata.pt"
+    # ── Save metadata + manifest ─────────────────────────────────────────────
     texts_path = Path(output_dir) / f"layer{layer}_source_texts.pt"
+    manifest_path = Path(output_dir) / f"layer{layer}_chunk_manifest.json"
 
-    torch.save(activation_tensor, acts_path)
-    torch.save(token_metadata, meta_path)
     torch.save(texts, texts_path)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "layer": layer,
+                "model_name": model_name,
+                "chunk_size": chunk_size,
+                "total_tokens": total_tokens,
+                "chunks": chunk_manifest,
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
 
-    # ── Stats report ──────────────────────────────────────────────────────────
-    size_mb = acts_path.stat().st_size / 1e6
     logger.info(
         f"\n{'─'*50}\n"
         f"✅ ACTIVATION COLLECTION COMPLETE\n"
-        f"   Shape:       {activation_tensor.shape}\n"
-        f"   Dtype:       {activation_tensor.dtype}\n"
-        f"   Value range: [{activation_tensor.float().min():.3f}, "
-        f"{activation_tensor.float().max():.3f}]\n"
-        f"   Tokens:      {activation_tensor.shape[0]:,}\n"
-        f"   Saved to:    {acts_path} ({size_mb:.1f} MB)\n"
+        f"   Tokens collected: {total_tokens:,}\n"
+        f"   Chunks saved:     {len(chunk_manifest)}\n"
+        f"   Cache dir:        {output_dir}\n"
+        f"   Manifest:         {manifest_path}\n"
         f"{'─'*50}"
     )
 
-    return activation_tensor, token_metadata
+    return torch.empty(0), []
 
 
 def main():
@@ -229,8 +364,12 @@ def main():
         help="Maximum token length per sentence"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=16,
-        help="Sentences per batch"
+        "--batch-size", type=int, default=4,
+        help="Sentences per batch (lower for weaker systems)"
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=100_000,
+        help="Maximum token rows to keep in memory before flushing a chunk"
     )
     parser.add_argument(
         "--half", action="store_true",
@@ -251,6 +390,7 @@ def main():
         max_sentences=args.max_sentences,
         max_length=args.max_length,
         batch_size=args.batch_size,
+        chunk_size=args.chunk_size,
         use_half=args.half,
         model_name=args.model,
     )
