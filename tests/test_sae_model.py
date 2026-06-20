@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from sae_model import SparseAutoencoder, compute_loss
+from feature_analysis import load_trained_sae
 
 
 class TestSparseAutoencoder:
@@ -64,6 +65,29 @@ class TestSparseAutoencoder:
         # encoder: 768*4096 + 4096, decoder: 4096*768 + 768
         expected = (768 * 4096 + 4096) + (4096 * 768 + 768)
         assert sae.num_parameters() == expected
+
+    def test_load_trained_sae_restores_topk_metadata(self, tmp_path):
+        ckpt_path = tmp_path / "test_sae.pt"
+        sae = SparseAutoencoder(
+            d_model=768,
+            d_hidden=128,
+            sparsity_type="topk",
+            topk=5,
+        )
+        torch.save(
+            {
+                "model_state_dict": sae.state_dict(),
+                "d_model": 768,
+                "d_hidden": 128,
+                "topk": 5,
+                "sparsity_type": "topk",
+            },
+            ckpt_path,
+        )
+
+        loaded = load_trained_sae(str(ckpt_path), device="cpu")
+        assert loaded.sparsity_type == "topk"
+        assert loaded.topk == 5
 
 
 class TestLossFunction:

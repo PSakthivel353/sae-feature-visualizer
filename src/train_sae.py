@@ -228,6 +228,7 @@ def train(
                 "d_hidden": d_hidden,
                 "epoch": epoch,
                 "val_loss": val_loss,
+                "sparsity_type": "topk",
                 "topk": topk,
                 "avg_active_features": avg_active,
             }, best_path)
@@ -249,6 +250,7 @@ def train(
         "d_hidden": d_hidden,
         "epoch": epoch,
         "val_loss": val_loss,
+        "sparsity_type": "topk",
         "topk": topk,
         "avg_active_features": avg_active,
     }, final_path)

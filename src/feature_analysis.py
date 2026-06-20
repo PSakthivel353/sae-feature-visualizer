@@ -43,7 +43,14 @@ def load_trained_sae(checkpoint_path: str, device: str = "cpu") -> SparseAutoenc
     if "model_state_dict" in ckpt:
         d_model = ckpt.get("d_model", 768)
         d_hidden = ckpt.get("d_hidden", 4096)
-        sae = SparseAutoencoder(d_model=d_model, d_hidden=d_hidden)
+        sparsity_type = ckpt.get("sparsity_type", "topk" if "topk" in ckpt else "l1")
+        topk = ckpt.get("topk", 32)
+        sae = SparseAutoencoder(
+            d_model=d_model,
+            d_hidden=d_hidden,
+            sparsity_type=sparsity_type,
+            topk=topk,
+        )
         sae.load_state_dict(ckpt["model_state_dict"])
     else:
         # Legacy format: raw state_dict
@@ -114,24 +121,30 @@ def find_top_examples_per_feature(
     results = {}
     for fid in tqdm(feature_ids, desc="Finding top examples"):
         scores = hidden[:, fid]
-        if scores.max() == 0:
+        active_mask = scores != 0
+        if not active_mask.any():
             results[fid] = []  # Dead feature — never activates
             continue
 
-        k = min(top_n, (scores > 0).sum().item())
+        k = min(top_n, int(active_mask.sum().item()))
         if k == 0:
             results[fid] = []
             continue
 
-        top_vals, top_idxs = scores.topk(k)
+        # For Top-K SAE, values may be negative; use magnitude to select the most
+        # influential examples, while still preserving the sign in the score.
+        score_abs = scores.abs()
+        top_abs, top_idxs = score_abs.topk(k)
         examples = []
-        for val, idx in zip(top_vals.tolist(), top_idxs.tolist()):
+        for abs_val, idx in zip(top_abs.tolist(), top_idxs.tolist()):
+            val = scores[idx].item()
             tok_str, sent_idx = token_metadata[idx]
             sentence = source_texts[sent_idx] if sent_idx < len(source_texts) else ""
             examples.append({
                 "token": tok_str,
                 "sentence": sentence,
                 "score": round(val, 4),
+                "abs_score": round(abs_val, 4),
             })
         results[fid] = examples
 
@@ -149,17 +162,18 @@ def compute_feature_stats(hidden: torch.Tensor) -> Dict[int, Dict]:
     n_tokens, n_features = hidden.shape
     stats = {}
 
-    active_mask = hidden > 0
+    active_mask = hidden != 0
     frequencies = active_mask.float().mean(dim=0)  # (n_features,)
-    max_vals = hidden.max(dim=0).values
+    max_abs = hidden.abs().max(dim=0).values
 
     for fid in range(n_features):
         col = hidden[:, fid]
-        active_vals = col[col > 0]
+        active_vals = col[col != 0]
         stats[fid] = {
             "frequency": round(frequencies[fid].item(), 6),
             "mean_activation": round(active_vals.mean().item(), 4) if len(active_vals) > 0 else 0.0,
-            "max_activation": round(max_vals[fid].item(), 4),
+            "max_activation": round(hidden[:, fid].abs().max().item(), 4),
+            "max_abs_activation": round(max_abs[fid].item(), 4),
             "is_dead": bool(frequencies[fid].item() == 0),
         }
     return stats
@@ -174,6 +188,7 @@ def run_semantic_sanity_test(
     device: str = "cpu",
     sentence_a: str = "The attorney filed a motion in court",
     sentence_b: str = "The protein binds to the receptor",
+    topk: int = 5,
 ) -> Dict:
     """
     The most important validation test (per project testing strategy):
@@ -192,15 +207,28 @@ def run_semantic_sanity_test(
         with torch.no_grad():
             model(**tokens)
         act = get_activation(f"layer_{layer}")  # (1, seq_len, 768)
-        act = act.mean(dim=1)  # average over tokens for a sentence-level vector
+        # Use the final token representation for sentence-level probing.
+        # For causal models like GPT-2, the last token often carries the best
+        # sentence-level signal; averaging all tokens can blur distinct semantics.
+        act = act[:, -1, :]  # (1, 768)
         act_norm = (act - stats["mean"]) / (stats["std"] + 1e-8)
         with torch.no_grad():
             hidden = sae.encode(act_norm.to(device))
+
+        # For Top-K encoders, the hidden activations are exactly zero for all but the
+        # chosen features. We therefore use the nonzero entries directly instead of
+        # assuming all positive values are meaningful.
+        if sae.sparsity_type == "topk":
+            hidden_vals = hidden[0]
+            top_idx = hidden_vals.abs().topk(k).indices
+            top_vals = hidden_vals[top_idx]
+            return set(top_idx.tolist()), top_vals.tolist()
+
         top = hidden[0].topk(k)
         return set(top.indices.tolist()), top.values.tolist()
 
-    feats_a, vals_a = get_top_features(sentence_a)
-    feats_b, vals_b = get_top_features(sentence_b)
+    feats_a, vals_a = get_top_features(sentence_a, k=topk)
+    feats_b, vals_b = get_top_features(sentence_b, k=topk)
     remove_hooks()
 
     overlap = feats_a & feats_b
@@ -216,7 +244,7 @@ def run_semantic_sanity_test(
         "diagnosis": (
             "✅ SAE is working correctly — disjoint feature sets for unrelated concepts."
             if passed else
-            "⚠️  Features overlap — lambda may be too low (not sparse enough). Consider increasing it."
+            "⚠️  Features overlap — the model may not be loading the intended sparsity settings, or the example pair is not sufficiently distinct."
         ),
     }
     return result
@@ -279,7 +307,13 @@ def main():
         from hooks import load_model_and_tokenizer
         model, tokenizer = load_model_and_tokenizer(device=device)
         result = run_semantic_sanity_test(
-            sae, model, tokenizer, args.layer, norm_stats_path, device
+            sae,
+            model,
+            tokenizer,
+            args.layer,
+            norm_stats_path,
+            device,
+            topk=min(5, getattr(sae, "topk", 5)),
         )
         print(json.dumps(result, indent=2))
         with open(f"{args.output_dir}/sanity_test_result.json", "w") as f:
